@@ -113,6 +113,7 @@ const coordError = computed<string | null>(() => {
             :model-value="modelValue.collectDate"
             type="date"
             value-format="YYYY-MM-DD"
+            :disabled="disabled"
             style="width: 100%"
             @update:model-value="(value: string | null) => patch({ collectDate: value ?? '' })"
           />

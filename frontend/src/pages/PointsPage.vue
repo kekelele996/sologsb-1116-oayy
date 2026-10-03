@@ -1,17 +1,32 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { CollectPoint } from '@/types'
+import type { CollectPoint, NewRow } from '@/types'
+import { ROLE_RECORDER } from '@/types'
 import GeoPointForm from '@/components/common/GeoPointForm.vue'
+import RecoveryBanner from '@/components/common/RecoveryBanner.vue'
+import VersionBadge from '@/components/common/VersionBadge.vue'
 import { useStore } from '@/hooks/usePersistentStore'
+import { useEditLock } from '@/hooks/useEditLock'
 import { pointStore } from '@/stores/pointStore'
 import { recordStore } from '@/stores/recordStore'
+import { sessionStore, currentEditorName } from '@/stores/sessionStore'
+import { draftStore, type RecoveryDraft } from '@/stores/draftStore'
+import { reportSaveError } from '@/concurrency/saveErrors'
 import { uid } from '@/utils/id'
 
 const pointState = useStore(pointStore)
 const recordState = useStore(recordStore)
+const session = useStore(sessionStore)
+const draftState = useStore(draftStore)
+
+const isRecorder = computed(() => session.role === ROLE_RECORDER)
 
 const editingId = ref<string | null>(null)
+/** 打开编辑时快照（版本基准） */
+const basePoint = ref<CollectPoint | null>(null)
+const pendingCreateId = ref('')
+const saving = ref(false)
 const draft = reactive<CollectPoint>({
   id: '',
   name: '',
@@ -22,8 +37,21 @@ const draft = reactive<CollectPoint>({
   substrate: '落叶层',
   companionTrees: '',
   collectDate: new Date().toISOString().slice(0, 10),
-  collector: ''
+  collector: '',
+  version: 0,
+  owner: 'recorder',
+  updatedBy: '',
+  updatedAt: ''
 })
+
+/** 正在编辑的采集点写锁（新建时目标为空，不持锁） */
+const editLock = useEditLock({
+  scope: 'point',
+  targetId: computed(() => editingId.value ?? '')
+})
+
+const isEdit = computed(() => editingId.value !== null)
+const formLocked = computed(() => isEdit.value && !editLock.writable.value)
 
 const coordError = computed<string | null>(() => {
   const { longitude, latitude } = draft
@@ -42,26 +70,72 @@ watch(
   }
 )
 
-function resetDraft(): void {
-  editingId.value = null
-  draft.id = ''
-  draft.name = ''
-  draft.longitude = 116.4
-  draft.latitude = 39.9
-  draft.altitude = 800
-  draft.vegetation = '针阔混交林'
-  draft.substrate = '落叶层'
-  draft.companionTrees = ''
-  draft.collector = ''
-  draft.collectDate = new Date().toISOString().slice(0, 10)
+function newDraftRow(): CollectPoint {
+  return {
+    id: '',
+    name: '',
+    longitude: 116.4,
+    latitude: 39.9,
+    altitude: 800,
+    vegetation: '针阔混交林',
+    substrate: '落叶层',
+    companionTrees: '',
+    collectDate: new Date().toISOString().slice(0, 10),
+    collector: session.recorderName,
+    version: 0,
+    owner: 'recorder',
+    updatedBy: '',
+    updatedAt: ''
+  }
 }
 
-function edit(point: CollectPoint): void {
+function resetDraft(): void {
+  void editLock.release()
+  editingId.value = null
+  basePoint.value = null
+  pendingCreateId.value = ''
+  Object.assign(draft, newDraftRow())
+}
+
+async function edit(point: CollectPoint): Promise<void> {
+  if (!isRecorder.value) {
+    ElMessage.warning('采集点归记录员维护，请先切换为「记录员」身份')
+    return
+  }
   editingId.value = point.id
+  basePoint.value = null
   Object.assign(draft, point)
+  const granted = await editLock.request()
+  // 申请锁期间可能已被别处改过，以最新整行为版本基准
+  const latest = pointState.points.find((item) => item.id === point.id) ?? point
+  basePoint.value = latest
+  Object.assign(draft, latest)
+  if (!granted) ElMessage.warning('该采集点正被另一窗口编辑，当前为只读')
+}
+
+async function stashDraft(reason: string): Promise<void> {
+  const targetId = isEdit.value ? editingId.value! : pendingCreateId.value || draft.id || uid('pt')
+  await draftStore.getState().upsertDraft({
+    scope: 'point',
+    targetId,
+    kind: 'point',
+    code: draft.name.trim() || '新建采集点',
+    payload: JSON.stringify({ ...draft, id: targetId }),
+    baseVersion: basePoint.value?.version,
+    reason,
+    updatedBy: currentEditorName() || '未署名'
+  })
 }
 
 async function submit(): Promise<void> {
+  if (!isRecorder.value) {
+    ElMessage.warning('鉴定人身份不能写采集点')
+    return
+  }
+  if (isEdit.value && !editLock.writable.value) {
+    ElMessage.warning('写权不在本窗口，不能保存')
+    return
+  }
   if (!draft.name.trim()) {
     ElMessage.warning('请填写采集点名称')
     return
@@ -70,16 +144,57 @@ async function submit(): Promise<void> {
     ElMessage.warning(coordError.value)
     return
   }
-  const row: CollectPoint = {
+  const id = isEdit.value ? editingId.value! : pendingCreateId.value || uid('pt')
+  if (!isEdit.value) pendingCreateId.value = id
+  const row: CollectPoint | NewRow<CollectPoint> = {
     ...draft,
-    id: editingId.value ?? uid('pt'),
+    id,
     name: draft.name.trim(),
     companionTrees: draft.companionTrees.trim(),
     collector: draft.collector.trim()
   }
-  await pointStore.getState().save(row)
-  ElMessage.success(editingId.value ? '采集点已更新' : '采集点已建立')
-  resetDraft()
+  saving.value = true
+  try {
+    const outcome = await pointStore
+      .getState()
+      .save(row, basePoint.value ?? undefined, currentEditorName())
+    ElMessage.success(isEdit.value ? `采集点已更新（v${outcome.version}）` : '采集点已建立')
+    await draftStore.getState().removeDraft(`${id}:point`).catch(() => undefined)
+    resetDraft()
+  } catch (error) {
+    const result = await reportSaveError(error, '采集点')
+    if (!result.ownership) {
+      await stashDraft(result.message)
+      ElMessage.info('本次未写入；内容已留为草稿，可在上方横幅恢复')
+    }
+  } finally {
+    saving.value = false
+  }
+}
+
+async function resumePointDraft(draftRow: RecoveryDraft): Promise<void> {
+  let payload: CollectPoint
+  try {
+    payload = JSON.parse(draftRow.payload) as CollectPoint
+  } catch {
+    ElMessage.error('草稿内容已损坏，无法恢复')
+    return
+  }
+  const existing = pointState.points.find((item) => item.id === draftRow.targetId)
+  if (existing) {
+    editingId.value = existing.id
+    pendingCreateId.value = ''
+    const granted = await editLock.request()
+    basePoint.value = pointState.points.find((item) => item.id === existing.id) ?? existing
+    Object.assign(draft, basePoint.value, payload)
+    if (!granted) ElMessage.warning('写权仍在另一窗口，草稿已载入，拿到写权后才能保存')
+  } else {
+    editingId.value = null
+    pendingCreateId.value = draftRow.targetId
+    basePoint.value = null
+    Object.assign(draft, newDraftRow(), payload, { id: draftRow.targetId })
+  }
+  ElMessage.success('采集点草稿已载入表单，核对后保存')
 }
 
 function recordsOf(pointId: string): number {
@@ -99,30 +214,86 @@ async function remove(point: CollectPoint): Promise<void> {
     ElMessage.error(`「${point.name}」下仍有 ${count} 条菌物条目，请先清理条目`)
     return
   }
-  await ElMessageBox.confirm(`确认删除采集点「${point.name}」？`, '删除确认', { type: 'warning' })
+  if (!isRecorder.value) {
+    ElMessage.warning('删除采集点归记录员操作')
+    return
+  }
+  await ElMessageBox.confirm(`确认删除采集点「${point.name}」？删除前需取得写权。`, '删除确认', {
+    type: 'warning'
+  })
+  editingId.value = point.id
+  const granted = await editLock.request()
+  if (!granted) {
+    ElMessage.error('该采集点正被另一窗口编辑，不能删除')
+    await editLock.release()
+    editingId.value = null
+    return
+  }
   await pointStore.getState().remove(point.id)
+  await draftStore.getState().removeDraft(`${point.id}:point`).catch(() => undefined)
+  await editLock.release()
+  editingId.value = null
   ElMessage.success('采集点已删除')
 }
+
+const pointDrafts = computed(() => draftState.drafts.filter((item) => item.kind === 'point'))
 </script>
 
 <template>
   <div class="page">
+    <RecoveryBanner
+      v-if="isRecorder && pointDrafts.length"
+      :drafts="pointDrafts"
+      title="中途失败的采集点草稿（记录员恢复入口）"
+      @resume="resumePointDraft"
+      @discard="(d) => draftStore.getState().removeDraft(d.id)"
+    />
     <div class="page-head">
       <div>
         <h2 class="page-title">采集点管理</h2>
         <p class="page-sub">
-          经纬度与海拔表单带格式校验；每个采集点展示条目数与主要基物，删除前校验下级条目数。
+          经纬度与海拔表单带格式校验；编辑既有采集点需取得该点写锁，保存前核对打开版本，冲突字段会被拦下。
         </p>
       </div>
-      <el-button @click="resetDraft">清空表单</el-button>
+      <el-button :disabled="!isRecorder" @click="resetDraft">清空表单</el-button>
     </div>
+    <el-alert
+      v-if="!isRecorder"
+      type="info"
+      :closable="false"
+      class="role-alert"
+      title="当前是鉴定人身份：采集点归记录员维护（本页只读）。"
+    />
 
     <el-card shadow="never" class="form-card">
-      <template #header>{{ editingId ? '编辑采集点' : '新增采集点' }}</template>
-      <GeoPointForm v-model="draft" with-meta />
-      <div class="actions">
-        <el-button type="primary" @click="submit">{{ editingId ? '保存修改' : '新增采集点' }}</el-button>
-      </div>
+      <template #header>
+        <div class="form-head">
+          <span>{{ isEdit ? '编辑采集点' : '新增采集点' }}</span>
+          <template v-if="isEdit">
+            <el-tag v-if="editLock.writable.value" type="success" size="small" effect="dark">本窗口持有写权</el-tag>
+            <el-tag v-else-if="editLock.heldByOther.value" type="info" size="small" effect="dark">
+              只读：写权在「{{ editLock.lock.value?.holderName }}」
+            </el-tag>
+            <el-tag v-else type="warning" size="small" effect="plain">尚未取得写权</el-tag>
+            <el-button size="small" :loading="editLock.acquiring.value" @click="editLock.request()">申请写权</el-button>
+            <span v-if="basePoint" class="muted">打开版本 v{{ basePoint.version }}</span>
+          </template>
+        </div>
+      </template>
+      <fieldset :disabled="formLocked" class="form-fieldset">
+        <GeoPointForm v-model="draft" with-meta />
+        <div class="actions">
+          <el-button
+            type="primary"
+            :loading="saving"
+            :disabled="isEdit && !editLock.writable.value"
+            @click="submit"
+          >
+            {{ isEdit ? `保存修改（基于 v${basePoint?.version ?? '?'}）` : '新增采集点' }}
+          </el-button>
+          <el-button v-if="isEdit" @click="resetDraft">放弃编辑</el-button>
+        </div>
+      </fieldset>
     </el-card>
 
     <h3 class="section-title">采集点清单（{{ pointState.points.length }}）</h3>
@@ -135,7 +306,10 @@ async function remove(point: CollectPoint): Promise<void> {
               {{ point.longitude.toFixed(4) }}, {{ point.latitude.toFixed(4) }} · {{ point.altitude }} m
             </div>
           </div>
-          <el-tag effect="plain" size="small">条目 {{ recordsOf(point.id) }}</el-tag>
+          <div class="point-head-tags">
+            <VersionBadge :row="point" />
+            <el-tag effect="plain" size="small">条目 {{ recordsOf(point.id) }}</el-tag>
+          </div>
         </div>
         <el-descriptions :column="1" size="small" border class="desc">
           <el-descriptions-item label="植被类型">{{ point.vegetation }}</el-descriptions-item>
@@ -145,8 +319,8 @@ async function remove(point: CollectPoint): Promise<void> {
           <el-descriptions-item label="采集人">{{ point.collector || '—' }}</el-descriptions-item>
         </el-descriptions>
         <div class="point-actions">
-          <el-button size="small" @click="edit(point)">编辑</el-button>
-          <el-button size="small" type="danger" plain @click="remove(point)">删除</el-button>
+          <el-button size="small" :disabled="!isRecorder" @click="edit(point)">编辑</el-button>
+          <el-button size="small" type="danger" plain :disabled="!isRecorder" @click="remove(point)">删除</el-button>
         </div>
       </el-card>
       <el-empty v-if="pointState.points.length === 0" description="暂无采集点" />
@@ -155,8 +329,22 @@ async function remove(point: CollectPoint): Promise<void> {
 </template>
 
 <style scoped>
+.role-alert {
+  margin-bottom: 12px;
+}
 .form-card {
   border-radius: 12px;
+}
+.form-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.form-fieldset[disabled] {
+  border: 0;
+  padding: 0;
+  opacity: 0.8;
 }
 .actions {
   margin-top: 12px;
@@ -170,6 +358,12 @@ async function remove(point: CollectPoint): Promise<void> {
   align-items: flex-start;
   gap: 8px;
   margin-bottom: 10px;
+}
+.point-head-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
 }
 .point-name {
   font-size: 15px;

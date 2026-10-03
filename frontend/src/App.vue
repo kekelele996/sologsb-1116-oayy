@@ -6,18 +6,21 @@ import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { sessionStore } from '@/stores/sessionStore'
+import { ROLE_IDENTIFIER, ROLE_LABELS, ROLE_RECORDER, type EditorRole } from '@/types'
 
 const route = useRoute()
 const recordState = useStore(recordStore)
 const sporeState = useStore(sporeStore)
 const pointState = useStore(pointStore)
 const identifyState = useStore(identifyStore)
+const session = useStore(sessionStore)
 
 const menus = [
-  { path: '/atlas', label: '图谱总览', icon: 'Grid' },
-  { path: '/points', label: '采集点管理', icon: 'Location' },
-  { path: '/identify', label: '鉴定工作页', icon: 'Search' },
-  { path: '/compare', label: '条目对比', icon: 'Files' }
+  { path: '/atlas', label: '图谱总览', icon: 'Grid', role: ROLE_RECORDER as EditorRole },
+  { path: '/points', label: '采集点管理', icon: 'Location', role: ROLE_RECORDER as EditorRole },
+  { path: '/identify', label: '鉴定工作页', icon: 'Search', role: ROLE_IDENTIFIER as EditorRole },
+  { path: '/compare', label: '条目对比', icon: 'Files', role: null }
 ]
 
 const activeMenu = computed(() => menus.find((item) => route.path.startsWith(item.path))?.path ?? '/atlas')
@@ -29,11 +32,17 @@ const stats = computed(() => [
   { label: '鉴定留痕', value: identifyState.logs.length }
 ])
 
+const currentName = computed(() =>
+  session.role === ROLE_RECORDER ? session.recorderName : session.identifierName
+)
+
 onMounted(async () => {
-  await recordStore.getState().hydrate()
-  await sporeStore.getState().hydrate()
-  await pointStore.getState().hydrate()
-  await identifyStore.getState().hydrate()
+  await Promise.all([
+    recordStore.getState().hydrate(),
+    sporeStore.getState().hydrate(),
+    pointStore.getState().hydrate(),
+    identifyStore.getState().hydrate()
+  ])
 })
 </script>
 
@@ -47,6 +56,31 @@ onMounted(async () => {
           <div class="brand-sub">Fungi Collection Atlas</div>
         </div>
       </div>
+
+      <el-radio-group
+        :model-value="session.role"
+        size="small"
+        class="role-switch"
+        @update:model-value="(value: string | number | boolean | undefined) => session.setRole(value as EditorRole)"
+      >
+        <el-radio-button :value="ROLE_RECORDER">{{ ROLE_LABELS[ROLE_RECORDER] }}</el-radio-button>
+        <el-radio-button :value="ROLE_IDENTIFIER">{{ ROLE_LABELS[ROLE_IDENTIFIER] }}</el-radio-button>
+      </el-radio-group>
+      <el-input
+        :model-value="currentName"
+        size="small"
+        class="name-input"
+        :placeholder="session.role === ROLE_RECORDER ? '记录员署名（如 沈禾）' : '鉴定人署名（如 祁野）'"
+        @update:model-value="(value: string) =>
+          session.role === ROLE_RECORDER
+            ? session.setRecorderName(value)
+            : session.setIdentifierName(value)"
+      />
+      <p class="role-tip">
+        当前身份：<b>{{ ROLE_LABELS[session.role] }}</b> ·
+        {{ session.role === ROLE_RECORDER ? '可写采集点 / 形态 / 孢子印' : '可写鉴定结论 / 复核' }}
+      </p>
+
       <el-menu :default-active="activeMenu" router class="menu">
         <el-menu-item v-for="item in menus" :key="item.path" :index="item.path">
           <el-icon><component :is="item.icon" /></el-icon>
@@ -58,13 +92,16 @@ onMounted(async () => {
           <span>{{ item.label }}</span>
           <b>{{ item.value }}</b>
         </div>
-        <p class="stat-tip">数据保存在浏览器 IndexedDB，无需后端服务</p>
+        <p class="stat-tip">数据保存在浏览器 IndexedDB，多窗口靠版本号与写锁协同</p>
       </div>
     </el-aside>
     <el-container>
       <el-header class="header">
         <span class="crumb">{{ (route.meta.title as string) ?? '图谱' }}</span>
-        <span class="head-tip">采集点 → 形态描述 → 孢子印 → 鉴定结论，全过程留痕</span>
+        <span class="head-tip">
+          {{ ROLE_LABELS[session.role] }}
+          {{ currentName || '未署名' }} · 采集点 → 形态描述 → 孢子印 → 鉴定结论，全过程留版本
+        </span>
       </el-header>
       <el-main class="main">
         <p class="warn-strip">
@@ -91,7 +128,7 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 18px;
+  margin-bottom: 14px;
 }
 .logo {
   width: 36px;
@@ -111,6 +148,26 @@ onMounted(async () => {
 }
 .brand-sub {
   font-size: 11px;
+  color: #c9b6a3;
+}
+.role-switch {
+  width: 100%;
+  margin-bottom: 8px;
+}
+.role-switch :deep(.el-radio-button) {
+  width: 50%;
+}
+.role-switch :deep(.el-radio-button__inner) {
+  width: 100%;
+  padding: 8px 0;
+}
+.name-input {
+  margin-bottom: 6px;
+}
+.role-tip {
+  margin: 0 2px 12px;
+  font-size: 11px;
+  line-height: 1.5;
   color: #c9b6a3;
 }
 .menu {

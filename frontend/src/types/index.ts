@@ -1,4 +1,11 @@
 export {
+  ROLE_RECORDER,
+  ROLE_IDENTIFIER,
+  ROLE_LABELS,
+  DOMAIN_LABELS
+} from './concurrent'
+export type { EditorRole, VersionedRow, NewRow } from './concurrent'
+export {
   GILL_ATTACHMENTS,
   GILL_DENSITIES,
   CAP_SHAPES,

@@ -1,4 +1,6 @@
 /** 菌褶/菌管着生方式 */
+import type { VersionedRow } from './concurrent'
+
 export const GILL_ATTACHMENTS = ['离生', '弯生', '直生', '延生'] as const
 export type GillAttachment = (typeof GILL_ATTACHMENTS)[number]
 
@@ -30,8 +32,8 @@ export type RingType = (typeof RING_TYPES)[number]
 export const VOLVA_TYPES = ['无菌托', '杯状菌托', '鳞片状菌托', '苞状菌托'] as const
 export type VolvaType = (typeof VOLVA_TYPES)[number]
 
-/** FungusRecord 菌物条目 */
-export interface FungusRecord {
+/** FungusRecord 菌物条目（归属：记录员） */
+export interface FungusRecord extends VersionedRow {
   id: string
   /** 采集编号 */
   code: string

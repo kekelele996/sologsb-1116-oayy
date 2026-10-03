@@ -2,7 +2,13 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import type { FungusRecord, GillAttachment, SporeColor } from '@/types'
+import type {
+  FungusRecord,
+  GillAttachment,
+  NewRow,
+  SporeColor,
+  VersionedRow
+} from '@/types'
 import {
   CAP_MARGINS,
   CAP_SHAPES,
@@ -10,6 +16,7 @@ import {
   FLESH_REACTIONS,
   GILL_ATTACHMENTS,
   GILL_DENSITIES,
+  ROLE_RECORDER,
   RING_TYPES,
   SPORE_COLORS,
   VOLVA_TYPES
@@ -17,12 +24,18 @@ import {
 import GillAttachmentTag from '@/components/common/GillAttachmentTag.vue'
 import SporePrintSwatch from '@/components/common/SporePrintSwatch.vue'
 import TraitsSummary from '@/components/common/TraitsSummary.vue'
+import VersionBadge from '@/components/common/VersionBadge.vue'
+import RecoveryBanner from '@/components/common/RecoveryBanner.vue'
 import { useStore } from '@/hooks/usePersistentStore'
+import { useEditLock } from '@/hooks/useEditLock'
 import { useCandidateMatch, EMPTY_CRITERIA, type MatchCriteria } from '@/hooks/useCandidateMatch'
 import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
 import { identifyStore } from '@/stores/identifyStore'
+import { sessionStore, currentEditorName } from '@/stores/sessionStore'
+import { draftStore, type RecoveryDraft } from '@/stores/draftStore'
+import { reportSaveError } from '@/concurrency/saveErrors'
 import { uid } from '@/utils/id'
 
 const router = useRouter()
@@ -30,6 +43,10 @@ const recordState = useStore(recordStore)
 const sporeState = useStore(sporeStore)
 const pointState = useStore(pointStore)
 const identifyState = useStore(identifyStore)
+const session = useStore(sessionStore)
+const draftState = useStore(draftStore)
+
+const isRecorder = computed(() => session.role === ROLE_RECORDER)
 
 const filterAttachment = ref<GillAttachment | ''>('')
 const filterColor = ref<SporeColor | ''>('')
@@ -99,9 +116,20 @@ function goCompare(): void {
   void router.push({ path: '/compare', query: { ids: compareIds.value.join(',') } })
 }
 
-/* ---------- 新建条目 ---------- */
+/* ---------- 新建 / 编辑条目对话框 ---------- */
+type DialogMode = 'create' | 'edit'
 const dialogVisible = ref(false)
+const dialogMode = ref<DialogMode>('create')
+/** 编辑对象 ID；新建时为空（此时不持锁） */
+const editingId = ref('')
+/** 新建态在打开对话框时就分配好的 ID，保证失败草稿与恢复后的行是同一个 id */
+const pendingCreateId = ref('')
+/** 打开对话框时看到的整行（版本核对基准） */
+const baseRecord = ref<FungusRecord | null>(null)
+const saving = ref(false)
+
 const form = reactive({
+  id: '',
   code: '',
   tempName: '',
   pointId: '',
@@ -117,12 +145,18 @@ const form = reactive({
   stipeLength: 5,
   stipeDiameter: 1,
   ring: '无菌环' as FungusRecord['ring'],
-  volva: '无菌托' as FungusRecord['volva'],
+  volva: '无菌环' as FungusRecord['volva'],
   odor: '',
   hostTree: '',
   collectDate: new Date().toISOString().slice(0, 10),
   collector: '',
   note: ''
+})
+
+/** 编辑既有条目时申请条目写锁：同一条目别的窗口（含鉴定页）只读 */
+const editLock = useEditLock({
+  scope: 'entry',
+  targetId: computed(() => editingId.value)
 })
 
 watch(
@@ -133,28 +167,115 @@ watch(
   { immediate: true }
 )
 
+type RecordFormShape = Omit<FungusRecord, keyof VersionedRow | 'pointId'> & { pointId: string }
+
+function fillFormFromRecord(record: FungusRecord): void {
+  Object.assign(form, {
+    id: record.id,
+    code: record.code,
+    tempName: record.tempName,
+    pointId: record.pointId,
+    fruitBodyCount: record.fruitBodyCount,
+    capDiameter: record.capDiameter,
+    capShape: record.capShape,
+    capMargin: record.capMargin,
+    capTexture: record.capTexture,
+    fleshThickness: record.fleshThickness,
+    fleshReaction: record.fleshReaction,
+    attachment: record.attachment,
+    gillDensity: record.gillDensity,
+    stipeLength: record.stipeLength,
+    stipeDiameter: record.stipeDiameter,
+    ring: record.ring,
+    volva: record.volva,
+    odor: record.odor,
+    hostTree: record.hostTree,
+    collectDate: record.collectDate,
+    collector: record.collector,
+    note: record.note
+  })
+}
+
 function openCreate(): void {
-  form.code = `REC-${String(recordState.records.length + 1).padStart(3, '0')}`
-  form.tempName = ''
-  form.note = ''
+  if (!isRecorder.value) {
+    ElMessage.warning('形态条目归记录员填写，请先在左上角切换为「记录员」身份')
+    return
+  }
+  dialogMode.value = 'create'
+  editingId.value = ''
+  pendingCreateId.value = uid('rec')
+  baseRecord.value = null
+  Object.assign(form, {
+    id: pendingCreateId.value,
+    code: `REC-${String(recordState.records.length + 1).padStart(3, '0')}`,
+    tempName: '',
+    pointId: pointState.points[0]?.id ?? '',
+    fruitBodyCount: 1,
+    capDiameter: 5,
+    capShape: '平展',
+    capMargin: '全缘',
+    capTexture: '光滑',
+    fleshThickness: 1,
+    fleshReaction: '不变色',
+    attachment: '直生',
+    gillDensity: '中等',
+    stipeLength: 5,
+    stipeDiameter: 1,
+    ring: '无菌环',
+    volva: '无菌托',
+    odor: '',
+    hostTree: '',
+    collectDate: new Date().toISOString().slice(0, 10),
+    collector: session.recorderName,
+    note: ''
+  })
   dialogVisible.value = true
 }
 
-async function submit(): Promise<void> {
-  if (!form.code.trim()) {
-    ElMessage.warning('请填写采集编号')
+async function openEdit(record: FungusRecord): Promise<void> {
+  if (!isRecorder.value) {
+    ElMessage.warning('形态条目归记录员修改，请先在左上角切换为「记录员」身份')
     return
   }
-  if (!form.pointId) {
-    ElMessage.warning('请选择采集点')
+  dialogMode.value = 'edit'
+  editingId.value = record.id
+  baseRecord.value = null
+  fillFormFromRecord(record)
+  dialogVisible.value = true
+  const granted = await editLock.request()
+  // 申请锁期间可能又被别处改过，以 store 里最新整行作为版本基准
+  const latest = recordStore.getState().records.find((item) => item.id === record.id) ?? record
+  baseRecord.value = latest
+  fillFormFromRecord(latest)
+  if (!granted) {
+    ElMessage.warning('该条目正被另一窗口编辑，当前为只读；对方关闭后可再取得写权')
+  }
+}
+
+async function reloadLatest(): Promise<void> {
+  if (!editingId.value) return
+  await recordStore.getState().hydrate()
+  const latest = recordState.records.find((item) => item.id === editingId.value)
+  if (!latest) {
+    ElMessage.error('该条目已被删除')
+    await closeDialog()
     return
   }
-  if (recordState.records.some((item) => item.code === form.code.trim())) {
-    ElMessage.warning(`采集编号「${form.code}」已存在，请换一个`)
-    return
-  }
-  const record: FungusRecord = {
-    id: uid('rec'),
+  baseRecord.value = latest
+  fillFormFromRecord(latest)
+}
+
+async function closeDialog(): Promise<void> {
+  dialogVisible.value = false
+  await editLock.release()
+  editingId.value = ''
+  pendingCreateId.value = ''
+  baseRecord.value = null
+}
+
+function buildRow(): RecordFormShape {
+  return {
+    id: dialogMode.value === 'edit' ? editingId.value : pendingCreateId.value,
     code: form.code.trim(),
     tempName: form.tempName.trim(),
     fruitBodyCount: Number(form.fruitBodyCount) || 1,
@@ -177,41 +298,173 @@ async function submit(): Promise<void> {
     collector: form.collector.trim(),
     note: form.note.trim()
   }
-  await recordStore.getState().save(record)
-  dialogVisible.value = false
-  ElMessage.success(`条目 ${record.code} 已建立`)
+}
+
+/** 保存失败（冲突 / IO 错误）：把表单内容留成草稿，之后可从记录员这侧恢复重来 */
+async function stashDraft(reason: string): Promise<void> {
+  const targetId = dialogMode.value === 'edit' ? editingId.value : pendingCreateId.value || form.id || uid('rec')
+  await draftStore.getState().upsertDraft({
+    scope: 'entry',
+    targetId,
+    kind: 'record',
+    code: form.code.trim() || '新建条目',
+    payload: JSON.stringify({ ...form, id: targetId }),
+    baseVersion: baseRecord.value?.version,
+    reason,
+    updatedBy: currentEditorName() || '未署名'
+  })
+}
+
+async function submit(): Promise<void> {
+  if (!isRecorder.value) {
+    ElMessage.warning('鉴定人身份不能写形态条目')
+    return
+  }
+  if (dialogMode.value === 'edit' && !editLock.writable.value) {
+    ElMessage.warning('写权不在本窗口，不能保存；请等待持有写权的窗口关闭')
+    return
+  }
+  if (!form.code.trim()) {
+    ElMessage.warning('请填写采集编号')
+    return
+  }
+  if (!form.pointId) {
+    ElMessage.warning('请选择采集点')
+    return
+  }
+  if (
+    dialogMode.value === 'create' &&
+    recordState.records.some((item) => item.code === form.code.trim())
+  ) {
+    ElMessage.warning(`采集编号「${form.code}」已存在，请换一个`)
+    return
+  }
+
+  const base = dialogMode.value === 'edit' ? baseRecord.value ?? undefined : undefined
+  const row = buildRow()
+  saving.value = true
+  try {
+    const outcome = await recordStore.getState().save(row as FungusRecord | NewRow<FungusRecord>, base, currentEditorName())
+    ElMessage.success(
+      dialogMode.value === 'edit'
+        ? `条目 ${row.code} 已更新到 v${outcome.version}（打开时为 v${base?.version ?? 0}）`
+        : `条目 ${row.code} 已建立（v${outcome.version}）`
+    )
+    await draftStore
+      .getState()
+      .removeDraft(`${dialogMode.value === 'edit' ? editingId.value : pendingCreateId.value}:record`)
+      .catch(() => undefined)
+    await closeDialog()
+  } catch (error) {
+    const result = await reportSaveError(error, '形态条目')
+    if (!result.ownership) {
+      // 版本冲突或写库失败：旧值没有被写回，表单内容转存为恢复草稿
+      await stashDraft(result.message)
+      ElMessage.info('本次未写入；你填的内容已留为草稿，可在上方横幅恢复重来')
+    }
+  } finally {
+    saving.value = false
+  }
+}
+
+/** 恢复草稿：重新打开对话框并尝试取得写权 */
+async function resumeDraft(draft: RecoveryDraft): Promise<void> {
+  if (draft.kind !== 'record') {
+    void router.push(`/atlas/${draft.targetId}`)
+    return
+  }
+  let payload: typeof form
+  try {
+    payload = JSON.parse(draft.payload) as typeof form
+    Object.assign(form, payload)
+  } catch {
+    ElMessage.error('草稿内容已损坏，无法恢复')
+    return
+  }
+  const existing = recordState.records.find((item) => item.id === draft.targetId)
+  dialogMode.value = existing ? 'edit' : 'create'
+  editingId.value = existing ? draft.targetId : ''
+  pendingCreateId.value = existing ? '' : draft.targetId
+  baseRecord.value = null
+  dialogVisible.value = true
+  let granted = true
+  if (existing) {
+    granted = await editLock.request()
+    await reloadLatest().catch(() => undefined)
+    // 恢复草稿要以草稿里的内容覆盖最新值（用户稍后自行合并）
+    Object.assign(form, payload)
+    baseRecord.value = recordStore.getState().records.find((item) => item.id === draft.targetId) ?? null
+    if (!granted) ElMessage.warning('写权仍在另一窗口，草稿已载入，拿到写权后才能保存')
+  }
 }
 
 async function removeRecord(record: FungusRecord): Promise<void> {
-  await ElMessageBox.confirm(`确认删除条目「${record.code}」？其孢子印与鉴定留痕一并清理`, '删除确认', {
-    type: 'warning'
-  })
+  if (!isRecorder.value) {
+    ElMessage.warning('删除条目归记录员操作')
+    return
+  }
+  await ElMessageBox.confirm(
+    `确认删除条目「${record.code}」？其孢子印与鉴定留痕一并清理。删除前需取得该条目的写权。`,
+    '删除确认',
+    { type: 'warning' }
+  )
+  editingId.value = record.id
+  const granted = await editLock.request()
+  if (!granted) {
+    ElMessage.error('该条目正被另一窗口编辑，不能删除')
+    await editLock.release()
+    editingId.value = ''
+    return
+  }
   await sporeStore.getState().removeByRecord(record.id)
   const logs = identifyState.logs.filter((item) => item.recordId === record.id)
   await Promise.all(logs.map((item) => identifyStore.getState().remove(item.id)))
   await recordStore.getState().remove(record.id)
+  await editLock.release()
+  editingId.value = ''
   ElMessage.success('条目已删除')
+}
+
+/** 该条目是否有可恢复草稿 */
+function draftMarker(recordId: string): RecoveryDraft[] {
+  return draftState.drafts.filter((item) => item.targetId === recordId)
 }
 </script>
 
 <template>
   <div class="page">
+    <RecoveryBanner
+      v-if="isRecorder && draftState.drafts.length"
+      :drafts="draftState.drafts"
+      title="中途失败的录入草稿（记录员恢复入口）"
+      @resume="resumeDraft"
+      @discard="(draft) => draftStore.getState().removeDraft(draft.id)"
+    />
+
     <div class="page-head">
       <div>
         <h2 class="page-title">图谱总览</h2>
         <p class="page-sub">
-          网格卡片展示菌盖形态要点、孢子印色块与鉴定状态；可按孢子印印色与菌褶/菌管着生方式筛选（同时作为候选排序条件）。
+          网格卡片展示菌盖形态要点、孢子印色块与鉴定状态；可按孢子印印色与菌褶/菌管着生方式筛选。
+          形态修改走「补形态」编辑对话框，保存前核对打开版本，冲突字段会被拦下。
         </p>
       </div>
       <div class="head-actions">
         <el-button v-if="compareIds.length > 0" type="primary" plain @click="goCompare">
           对比已选 {{ compareIds.length }} 条
         </el-button>
-        <el-button type="primary" @click="openCreate">
+        <el-button type="primary" :disabled="!isRecorder" @click="openCreate">
           <el-icon><Plus /></el-icon>新建条目
         </el-button>
       </div>
     </div>
+    <el-alert
+      v-if="!isRecorder"
+      type="info"
+      :closable="false"
+      class="role-alert"
+      title="当前是鉴定人身份：本页形态、采集点为只读；补形态请切换为记录员，落结论请去鉴定工作页。"
+    />
 
     <div class="toolbar">
       <el-select v-model="filterColor" placeholder="全部印色" clearable style="width: 150px">
@@ -263,8 +516,17 @@ async function removeRecord(record: FungusRecord): Promise<void> {
           <el-tag v-else type="warning" size="small" effect="plain">尚无鉴定结论</el-tag>
           <el-tag v-if="item.percent > 0" size="small" effect="plain">匹配度 {{ item.percent }}%</el-tag>
         </div>
+        <div class="version-line">
+          <VersionBadge :row="item.record" />
+          <el-tag v-if="draftMarker(item.record.id).length" type="danger" size="small" effect="plain">
+            有 {{ draftMarker(item.record.id).length }} 份未恢复草稿
+          </el-tag>
+        </div>
         <div class="card-actions">
           <el-button size="small" @click="router.push(`/atlas/${item.record.id}`)">详情</el-button>
+          <el-button size="small" type="warning" plain :disabled="!isRecorder" @click="openEdit(item.record)">
+            补形态
+          </el-button>
           <el-button
             size="small"
             :type="compareIds.includes(item.record.id) ? 'primary' : 'default'"
@@ -272,13 +534,40 @@ async function removeRecord(record: FungusRecord): Promise<void> {
           >
             {{ compareIds.includes(item.record.id) ? '已加入对比' : '加入对比' }}
           </el-button>
-          <el-button size="small" type="danger" plain @click="removeRecord(item.record)">删除</el-button>
+          <el-button size="small" type="danger" plain :disabled="!isRecorder" @click="removeRecord(item.record)">删除</el-button>
         </div>
       </el-card>
       <el-empty v-if="visible.length === 0" description="没有命中的条目，调整筛选条件或新建条目" />
     </div>
 
-    <el-dialog v-model="dialogVisible" title="新建菌物条目" width="720px">
+    <el-dialog
+      v-model="dialogVisible"
+      :title="dialogMode === 'edit' ? `补形态：${form.code || '条目'}` : '新建菌物条目'"
+      width="720px"
+      :close-on-click-modal="false"
+      @close="void closeDialog()"
+    >
+      <div class="dialog-status">
+        <template v-if="dialogMode === 'edit'">
+          <VersionBadge v-if="baseRecord" :row="baseRecord" detailed />
+          <el-tag v-if="editLock.writable.value" type="success" size="small" effect="dark">本窗口持有写权</el-tag>
+          <el-tag v-else-if="editLock.heldByOther.value" type="info" size="small" effect="dark">
+            只读：写权在「{{ editLock.lock.value?.holderName }}」窗口
+          </el-tag>
+          <el-tag v-else type="warning" size="small" effect="plain">尚未取得写权</el-tag>
+          <el-button
+            v-if="!editLock.writable.value"
+            size="small"
+            :loading="editLock.acquiring.value"
+            @click="editLock.request()"
+          >
+            申请写权
+          </el-button>
+          <el-button size="small" @click="reloadLatest">重新载入最新值</el-button>
+        </template>
+        <el-tag v-else type="success" size="small" effect="plain">新建无需写锁</el-tag>
+      </div>
+      <fieldset :disabled="dialogMode === 'edit' && !editLock.writable.value" class="dialog-fieldset">
       <el-form label-width="110px">
         <el-row :gutter="12">
           <el-col :span="12">
@@ -416,9 +705,17 @@ async function removeRecord(record: FungusRecord): Promise<void> {
           <el-input v-model="form.note" type="textarea" :rows="2" placeholder="仅作形态记录，不可作为食用依据" />
         </el-form-item>
       </el-form>
+      </fieldset>
       <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submit">保存条目</el-button>
+        <el-button @click="closeDialog">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="saving"
+          :disabled="dialogMode === 'edit' && !editLock.writable.value"
+          @click="submit"
+        >
+          {{ dialogMode === 'edit' ? `保存（基于打开版本 v${baseRecord?.version ?? '?'}）` : '保存条目' }}
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -428,6 +725,9 @@ async function removeRecord(record: FungusRecord): Promise<void> {
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.role-alert {
+  margin-bottom: 12px;
 }
 .atlas-card {
   border-radius: 12px;
@@ -462,10 +762,30 @@ async function removeRecord(record: FungusRecord): Promise<void> {
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
+  margin-bottom: 8px;
+}
+.version-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 10px;
 }
 .card-actions {
   display: flex;
   gap: 8px;
+}
+.dialog-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: #f7f5f0;
+}
+.dialog-fieldset[disabled] {
+  opacity: 0.75;
 }
 </style>

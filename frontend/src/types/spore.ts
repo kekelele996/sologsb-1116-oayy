@@ -1,9 +1,11 @@
+import type { VersionedRow } from './concurrent'
+
 /** 孢子印印色枚举 */
 export const SPORE_COLORS = ['白色', '奶油色', '淡黄', '粉褐', '紫褐', '黑褐'] as const
 export type SporeColor = (typeof SPORE_COLORS)[number]
 
-/** SporePrint 孢子印 */
-export interface SporePrint {
+/** SporePrint 孢子印（归属：记录员） */
+export interface SporePrint extends VersionedRow {
   id: string
   recordId: string
   color: SporeColor
