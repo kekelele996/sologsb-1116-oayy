@@ -14,4 +14,8 @@ export interface SporePrint {
   observeDate: string
   /** 样本干湿度说明 */
   moisture: string
+  /** 记录员（归属） */
+  recorder: string
+  /** 版本号：保存时 +1 */
+  version: number
 }

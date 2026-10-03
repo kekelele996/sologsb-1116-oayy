@@ -1,14 +1,19 @@
 <script setup lang="ts">
-import { computed, reactive, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import type { CollectPoint, SporeColor, SporePrint } from '@/types'
 import { SPORE_COLORS } from '@/types'
+import type { FieldConflict } from '@/types/concurrency'
+import { ConflictError } from '@/types/concurrency'
 import GeoPointForm from '@/components/common/GeoPointForm.vue'
 import GillAttachmentTag from '@/components/common/GillAttachmentTag.vue'
 import SporePrintSwatch from '@/components/common/SporePrintSwatch.vue'
 import TraitsSummary from '@/components/common/TraitsSummary.vue'
+import ConflictDialog from '@/components/common/ConflictDialog.vue'
 import { useStore } from '@/hooks/usePersistentStore'
+import { useEditorLock } from '@/hooks/useEditorLock'
+import { useVersionedDraft } from '@/hooks/useVersionedDraft'
 import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
 import { pointStore } from '@/stores/pointStore'
@@ -25,13 +30,31 @@ const identifyState = useStore(identifyStore)
 
 const record = computed(() => recordState.records.find((item) => item.id === route.params.id) ?? null)
 const spore = computed(() => sporeState.spores.find((item) => item.recordId === record.value?.id) ?? null)
+const point = computed(() => pointState.points.find((item) => item.id === record.value?.pointId) ?? null)
 const logs = computed(() => identifyState.logs.filter((item) => item.recordId === record.value?.id))
-/** 当前条目所属采集点名称（在脚本内取，避免模板内箭头函数丢失空值收窄） */
-const recordPointName = computed(() => {
-  const current = record.value
-  if (!current) return '未关联'
-  return pointState.points.find((item) => item.id === current.pointId)?.name ?? '未关联'
-})
+/** 当前条目所属采集点名称 */
+const recordPointName = computed(() => point.value?.name ?? '未关联')
+
+// 编辑锁：记录员角色，同一条目同一时间只允许一个窗口写
+const { readOnly, lockHolder } = useEditorLock(
+  'record',
+  computed(() => record.value?.id ?? ''),
+  'recorder'
+)
+
+// 版本化草稿：固定打开时的版本与快照
+const {
+  baseVersion: sporeBaseVersion,
+  baseSnapshot: sporeBaseSnapshot,
+  reset: resetSporeVersion,
+  commit: commitSpore
+} = useVersionedDraft(spore)
+const {
+  baseVersion: pointBaseVersion,
+  baseSnapshot: pointBaseSnapshot,
+  reset: resetPointVersion,
+  commit: commitPoint
+} = useVersionedDraft(point)
 
 const sporeForm = reactive({
   id: '',
@@ -52,27 +75,61 @@ const pointDraft = reactive<CollectPoint>({
   substrate: '落叶层',
   companionTrees: '',
   collectDate: '',
-  collector: ''
+  collector: '',
+  recorder: '',
+  version: 1
 })
+
+// 冲突对话框
+const conflictVisible = ref(false)
+const conflictConflicts = ref<FieldConflict[]>([])
+const conflictBaseVersion = ref(1)
+const conflictCurrentVersion = ref(1)
+
+function showConflict(e: ConflictError): void {
+  conflictConflicts.value = e.conflicts
+  conflictBaseVersion.value = e.baseVersion
+  conflictCurrentVersion.value = e.currentVersion
+  conflictVisible.value = true
+}
+
+/** 从 store 最新数据同步表单与版本基准 */
+function syncForms(): void {
+  const currentSpore = spore.value
+  if (currentSpore) {
+    sporeForm.id = currentSpore.id
+    sporeForm.color = currentSpore.color
+    sporeForm.shape = currentSpore.shape
+    sporeForm.hours = currentSpore.hours
+    sporeForm.observeDate = currentSpore.observeDate
+    sporeForm.moisture = currentSpore.moisture
+    resetSporeVersion(currentSpore)
+  }
+  const currentPoint = point.value
+  if (currentPoint) {
+    Object.assign(pointDraft, currentPoint)
+    resetPointVersion(currentPoint)
+  }
+}
 
 watch(
   () => [record.value?.id, spore.value?.id, pointState.points.length] as const,
   () => {
-    if (!record.value) return
-    const current = spore.value
-    if (current) {
-      sporeForm.id = current.id
-      sporeForm.color = current.color
-      sporeForm.shape = current.shape
-      sporeForm.hours = current.hours
-      sporeForm.observeDate = current.observeDate
-      sporeForm.moisture = current.moisture
-    }
-    const point = pointState.points.find((item) => item.id === record.value?.pointId)
-    if (point) Object.assign(pointDraft, point)
+    syncForms()
   },
   { immediate: true }
 )
+
+/** 重新载入 store 并同步表单（冲突后重试） */
+async function refreshFromStore(): Promise<void> {
+  await Promise.all([sporeStore.getState().hydrate(), pointStore.getState().hydrate()])
+  syncForms()
+}
+
+async function handleRetry(): Promise<void> {
+  await refreshFromStore()
+  ElMessage.info('已载入最新版本，请重新编辑后保存')
+}
 
 async function saveSpore(): Promise<void> {
   if (!record.value) return
@@ -83,11 +140,24 @@ async function saveSpore(): Promise<void> {
     shape: sporeForm.shape.trim(),
     hours: Number(sporeForm.hours) || 0,
     observeDate: sporeForm.observeDate,
-    moisture: sporeForm.moisture.trim()
+    moisture: sporeForm.moisture.trim(),
+    recorder: spore.value?.recorder || record.value.recorder || '',
+    version: spore.value?.version ?? 1
   }
-  await sporeStore.getState().save(row)
-  sporeForm.id = row.id
-  ElMessage.success(`孢子印观察已记录：${row.color}`)
+  try {
+    const result = await sporeStore
+      .getState()
+      .save(row, sporeBaseVersion.value, sporeBaseSnapshot.value ?? row)
+    commitSpore(result.saved)
+    sporeForm.id = row.id
+    ElMessage.success(`孢子印观察已记录：${row.color}`)
+  } catch (e) {
+    if (e instanceof ConflictError) {
+      showConflict(e)
+    } else {
+      throw e
+    }
+  }
 }
 
 async function savePoint(): Promise<void> {
@@ -95,8 +165,19 @@ async function savePoint(): Promise<void> {
     ElMessage.warning('采集点名称不能为空')
     return
   }
-  await pointStore.getState().save({ ...pointDraft })
-  ElMessage.success('采集点信息已更新')
+  try {
+    const result = await pointStore
+      .getState()
+      .save({ ...pointDraft }, pointBaseVersion.value, pointBaseSnapshot.value ?? { ...pointDraft })
+    commitPoint(result.saved)
+    ElMessage.success('采集点信息已更新')
+  } catch (e) {
+    if (e instanceof ConflictError) {
+      showConflict(e)
+    } else {
+      throw e
+    }
+  }
 }
 
 async function removeSpore(): Promise<void> {
@@ -116,6 +197,7 @@ async function removeSpore(): Promise<void> {
           <span class="mono">{{ record.code }}</span> · 采集点
           {{ recordPointName }} · 采集日期
           {{ record.collectDate }} · 采集人 {{ record.collector || '—' }}
+          <el-tag size="small" effect="plain" round class="ver-tag">记录稿 v{{ record.version }}</el-tag>
         </p>
       </div>
       <div v-else>
@@ -127,6 +209,14 @@ async function removeSpore(): Promise<void> {
         <el-button v-if="record" @click="router.push('/identify')">去鉴定</el-button>
       </div>
     </div>
+
+    <el-alert
+      v-if="readOnly"
+      class="lock-banner"
+      type="warning"
+      show-icon
+      :title="`该条目正被其他窗口编辑（会话 ${lockHolder ?? '未知'}），当前为只读模式。对方关闭窗口或超时后将自动释放。`"
+    />
 
     <template v-if="record">
       <el-card shadow="never" class="block">
@@ -159,25 +249,25 @@ async function removeSpore(): Promise<void> {
           </div>
           <el-form label-width="92px" class="spore-form">
             <el-form-item label="印色">
-              <el-select v-model="sporeForm.color" style="width: 100%">
+              <el-select v-model="sporeForm.color" style="width: 100%" :disabled="readOnly">
                 <el-option v-for="color in SPORE_COLORS" :key="color" :label="color" :value="color" />
               </el-select>
             </el-form-item>
             <el-form-item label="印形">
-              <el-input v-model="sporeForm.shape" placeholder="如 圆形印痕，边缘略散" />
+              <el-input v-model="sporeForm.shape" placeholder="如 圆形印痕，边缘略散" :disabled="readOnly" />
             </el-form-item>
             <el-form-item label="时长(h)">
-              <el-input-number v-model="sporeForm.hours" :min="0" :step="1" :controls="false" style="width: 100%" />
+              <el-input-number v-model="sporeForm.hours" :min="0" :step="1" :controls="false" style="width: 100%" :disabled="readOnly" />
             </el-form-item>
             <el-form-item label="观察日期">
-              <el-date-picker v-model="sporeForm.observeDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" />
+              <el-date-picker v-model="sporeForm.observeDate" type="date" value-format="YYYY-MM-DD" style="width: 100%" :disabled="readOnly" />
             </el-form-item>
             <el-form-item label="干湿度">
-              <el-input v-model="sporeForm.moisture" type="textarea" :rows="2" placeholder="如 子实体偏干，印痕较薄" />
+              <el-input v-model="sporeForm.moisture" type="textarea" :rows="2" placeholder="如 子实体偏干，印痕较薄" :disabled="readOnly" />
             </el-form-item>
             <div class="form-actions">
-              <el-button type="primary" @click="saveSpore">{{ sporeForm.id ? '更新孢子印' : '登记孢子印' }}</el-button>
-              <el-button v-if="sporeForm.id" type="danger" plain @click="removeSpore">删除记录</el-button>
+              <el-button type="primary" :disabled="readOnly" @click="saveSpore">{{ sporeForm.id ? '更新孢子印' : '登记孢子印' }}</el-button>
+              <el-button v-if="sporeForm.id" type="danger" plain :disabled="readOnly" @click="removeSpore">删除记录</el-button>
             </div>
           </el-form>
         </div>
@@ -185,9 +275,9 @@ async function removeSpore(): Promise<void> {
 
       <el-card shadow="never" class="block">
         <template #header>采集点信息（含经纬度校验）</template>
-        <GeoPointForm v-model="pointDraft" with-meta />
+        <GeoPointForm v-model="pointDraft" with-meta :disabled="readOnly" />
         <div class="form-actions">
-          <el-button type="primary" @click="savePoint">保存采集点</el-button>
+          <el-button type="primary" :disabled="readOnly" @click="savePoint">保存采集点</el-button>
         </div>
       </el-card>
 
@@ -213,6 +303,14 @@ async function removeSpore(): Promise<void> {
         <el-empty v-if="logs.length === 0" description="尚无鉴定结论，去「鉴定工作页」生成" />
       </el-card>
     </template>
+
+    <ConflictDialog
+      v-model:visible="conflictVisible"
+      :conflicts="conflictConflicts"
+      :base-version="conflictBaseVersion"
+      :current-version="conflictCurrentVersion"
+      @retry="handleRetry"
+    />
   </div>
 </template>
 
@@ -220,6 +318,14 @@ async function removeSpore(): Promise<void> {
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.ver-tag {
+  margin-left: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.lock-banner {
+  margin-bottom: 12px;
+  border-radius: 8px;
 }
 .block {
   border-radius: 12px;

@@ -2,21 +2,23 @@ import { onUnmounted, reactive } from 'vue'
 import type { StoreApi } from 'zustand/vanilla'
 import Dexie, { type Table } from 'dexie'
 import type { CollectPoint, FungusRecord, IdentifyLog, SporePrint } from '@/types'
+import type { EditLock } from '@/types/concurrency'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：条目 / 孢子印 / 采集点 / 鉴定结论 四张表 + 元数据表 */
+/** Dexie 封装：条目 / 孢子印 / 采集点 / 鉴定结论 / 编辑锁 五张表 + 元数据表 */
 class FungiGuideDb extends Dexie {
   records!: Table<FungusRecord, string>
   spores!: Table<SporePrint, string>
   points!: Table<CollectPoint, string>
   identifies!: Table<IdentifyLog, string>
+  locks!: Table<EditLock, string>
   meta!: Table<MetaRow, string>
 
   constructor() {
@@ -29,7 +31,7 @@ class FungiGuideDb extends Dexie {
       meta: 'key'
     })
     // v2：新增「菌肉变色反应」字段，迁移时为历史条目补齐默认值（不变色）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         records: 'id, code, pointId, attachment, capShape',
         spores: 'id, recordId, color, observeDate',
@@ -45,6 +47,54 @@ class FungiGuideDb extends Dexie {
             if (!record.fleshReaction) {
               record.fleshReaction = '不变色'
             }
+          })
+      })
+    // v3：新增版本号与归属字段（记录员 / 鉴定人），并引入编辑锁表
+    this.version(SCHEMA_VERSION)
+      .stores({
+        records: 'id, code, pointId, attachment, capShape, version',
+        spores: 'id, recordId, color, observeDate, version',
+        points: 'id, name, substrate, vegetation, version',
+        identifies: 'id, recordId, conclusion, date, version',
+        locks: 'key, owner, kind, entityId, role, expiresAt',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        // 回填历史条目的版本号与归属
+        await tx
+          .table<FungusRecord, string>('records')
+          .toCollection()
+          .modify((record) => {
+            if (record.version == null) record.version = 1
+            if (record.recorder == null || record.recorder === '') record.recorder = record.collector || ''
+            if (record.identifier == null) record.identifier = ''
+          })
+        await tx
+          .table<CollectPoint, string>('points')
+          .toCollection()
+          .modify((point) => {
+            if (point.version == null) point.version = 1
+            if (point.recorder == null || point.recorder === '') point.recorder = point.collector || ''
+          })
+        // 先取出所有条目，用于推断孢子印归属
+        const records = await tx.table<FungusRecord, string>('records').toArray()
+        const recordMap = new Map(records.map((r) => [r.id, r]))
+        await tx
+          .table<SporePrint, string>('spores')
+          .toCollection()
+          .modify((spore) => {
+            if (spore.version == null) spore.version = 1
+            if (spore.recorder == null || spore.recorder === '') {
+              const parent = recordMap.get(spore.recordId)
+              spore.recorder = parent?.recorder || parent?.collector || ''
+            }
+          })
+        await tx
+          .table<IdentifyLog, string>('identifies')
+          .toCollection()
+          .modify((log) => {
+            if (log.version == null) log.version = 1
+            if (log.identifier == null || log.identifier === '') log.identifier = log.reviewer || ''
           })
       })
   }
@@ -100,7 +150,9 @@ export async function seedDemoData(): Promise<void> {
       substrate: '落叶层',
       companionTrees: '辽东栎、油松',
       collectDate: today,
-      collector: '沈禾'
+      collector: '沈禾',
+      recorder: '沈禾',
+      version: 1
     },
     {
       id: 'pt_yls',
@@ -112,7 +164,9 @@ export async function seedDemoData(): Promise<void> {
       substrate: '腐木',
       companionTrees: '麻栎、枫香',
       collectDate: today,
-      collector: '沈禾'
+      collector: '沈禾',
+      recorder: '沈禾',
+      version: 1
     }
   ])
 
@@ -139,7 +193,10 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '辽东栎',
       collectDate: today,
       collector: '沈禾',
-      note: '菌管层易剥离，仅作形态记录'
+      note: '菌管层易剥离，仅作形态记录',
+      recorder: '沈禾',
+      identifier: '',
+      version: 1
     },
     {
       id: 'rec_002',
@@ -163,7 +220,10 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '油松',
       collectDate: today,
       collector: '沈禾',
-      note: '菌褶边缘略带紫晕'
+      note: '菌褶边缘略带紫晕',
+      recorder: '沈禾',
+      identifier: '',
+      version: 1
     },
     {
       id: 'rec_003',
@@ -187,7 +247,10 @@ export async function seedDemoData(): Promise<void> {
       hostTree: '麻栎',
       collectDate: today,
       collector: '祁野',
-      note: '生于倒木侧面，质地木栓化'
+      note: '生于倒木侧面，质地木栓化',
+      recorder: '祁野',
+      identifier: '',
+      version: 1
     }
   ])
 
@@ -199,7 +262,9 @@ export async function seedDemoData(): Promise<void> {
       shape: '圆形印痕，边缘略散',
       hours: 12,
       observeDate: today,
-      moisture: '子实体偏干，印痕较薄'
+      moisture: '子实体偏干，印痕较薄',
+      recorder: '沈禾',
+      version: 1
     },
     {
       id: 'spo_002',
@@ -208,7 +273,9 @@ export async function seedDemoData(): Promise<void> {
       shape: '圆形印痕，中心致密',
       hours: 8,
       observeDate: today,
-      moisture: '新鲜子实体，印痕厚实'
+      moisture: '新鲜子实体，印痕厚实',
+      recorder: '沈禾',
+      version: 1
     },
     {
       id: 'spo_003',
@@ -217,7 +284,9 @@ export async function seedDemoData(): Promise<void> {
       shape: '不规则印痕',
       hours: 24,
       observeDate: today,
-      moisture: '木质化样本，印痕浅'
+      moisture: '木质化样本，印痕浅',
+      recorder: '祁野',
+      version: 1
     }
   ])
 
@@ -232,7 +301,9 @@ export async function seedDemoData(): Promise<void> {
       confidence: '低',
       needReview: true,
       reviewer: '祁野',
-      date: today
+      date: today,
+      identifier: '祁野',
+      version: 1
     },
     {
       id: 'idf_002',
@@ -244,7 +315,9 @@ export async function seedDemoData(): Promise<void> {
       confidence: '中',
       needReview: false,
       reviewer: '祁野',
-      date: today
+      date: today,
+      identifier: '祁野',
+      version: 1
     }
   ])
 }

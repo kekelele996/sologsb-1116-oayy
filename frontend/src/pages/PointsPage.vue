@@ -2,7 +2,10 @@
 import { computed, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { CollectPoint } from '@/types'
+import type { FieldConflict } from '@/types/concurrency'
+import { ConflictError } from '@/types/concurrency'
 import GeoPointForm from '@/components/common/GeoPointForm.vue'
+import ConflictDialog from '@/components/common/ConflictDialog.vue'
 import { useStore } from '@/hooks/usePersistentStore'
 import { pointStore } from '@/stores/pointStore'
 import { recordStore } from '@/stores/recordStore'
@@ -22,8 +25,27 @@ const draft = reactive<CollectPoint>({
   substrate: '落叶层',
   companionTrees: '',
   collectDate: new Date().toISOString().slice(0, 10),
-  collector: ''
+  collector: '',
+  recorder: '',
+  version: 1
 })
+
+// 版本化草稿：固定打开时的版本与快照
+const pointBaseVersion = ref(1)
+const pointBaseSnapshot = ref<CollectPoint | null>(null)
+
+// 冲突对话框
+const conflictVisible = ref(false)
+const conflictConflicts = ref<FieldConflict[]>([])
+const conflictBaseVersion = ref(1)
+const conflictCurrentVersion = ref(1)
+
+function showConflict(e: ConflictError): void {
+  conflictConflicts.value = e.conflicts
+  conflictBaseVersion.value = e.baseVersion
+  conflictCurrentVersion.value = e.currentVersion
+  conflictVisible.value = true
+}
 
 const coordError = computed<string | null>(() => {
   const { longitude, latitude } = draft
@@ -53,12 +75,28 @@ function resetDraft(): void {
   draft.substrate = '落叶层'
   draft.companionTrees = ''
   draft.collector = ''
+  draft.recorder = ''
   draft.collectDate = new Date().toISOString().slice(0, 10)
+  pointBaseVersion.value = 1
+  pointBaseSnapshot.value = null
 }
 
 function edit(point: CollectPoint): void {
   editingId.value = point.id
   Object.assign(draft, point)
+  pointBaseVersion.value = point.version ?? 1
+  pointBaseSnapshot.value = structuredClone(point)
+}
+
+async function handleRetry(): Promise<void> {
+  await pointStore.getState().hydrate()
+  const latest = pointState.points.find((p) => p.id === editingId.value)
+  if (latest) {
+    Object.assign(draft, latest)
+    pointBaseVersion.value = latest.version ?? 1
+    pointBaseSnapshot.value = structuredClone(latest)
+  }
+  ElMessage.info('已载入最新版本，请重新编辑后保存')
 }
 
 async function submit(): Promise<void> {
@@ -75,11 +113,24 @@ async function submit(): Promise<void> {
     id: editingId.value ?? uid('pt'),
     name: draft.name.trim(),
     companionTrees: draft.companionTrees.trim(),
-    collector: draft.collector.trim()
+    collector: draft.collector.trim(),
+    recorder: draft.collector.trim()
   }
-  await pointStore.getState().save(row)
-  ElMessage.success(editingId.value ? '采集点已更新' : '采集点已建立')
-  resetDraft()
+  try {
+    const result = await pointStore
+      .getState()
+      .save(row, pointBaseVersion.value, pointBaseSnapshot.value ?? row)
+    pointBaseVersion.value = result.saved.version
+    pointBaseSnapshot.value = structuredClone(result.saved)
+    ElMessage.success(editingId.value ? '采集点已更新' : '采集点已建立')
+    resetDraft()
+  } catch (e) {
+    if (e instanceof ConflictError) {
+      showConflict(e)
+    } else {
+      throw e
+    }
+  }
 }
 
 function recordsOf(pointId: string): number {
@@ -151,6 +202,14 @@ async function remove(point: CollectPoint): Promise<void> {
       </el-card>
       <el-empty v-if="pointState.points.length === 0" description="暂无采集点" />
     </div>
+
+    <ConflictDialog
+      v-model:visible="conflictVisible"
+      :conflicts="conflictConflicts"
+      :base-version="conflictBaseVersion"
+      :current-version="conflictCurrentVersion"
+      @retry="handleRetry"
+    />
   </div>
 </template>
 

@@ -66,4 +66,10 @@ export interface FungusRecord {
   collector: string
   /** 备注（不可作为食用依据） */
   note: string
+  /** 记录员（归属：采集点、形态、孢子印归记录员） */
+  recorder: string
+  /** 鉴定人（归属：结论与复核归鉴定人） */
+  identifier: string
+  /** 版本号：记录员侧保存时 +1，用于乐观并发控制 */
+  version: number
 }

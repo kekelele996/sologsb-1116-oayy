@@ -21,4 +21,8 @@ export interface IdentifyLog {
   needReview: boolean
   reviewer: string
   date: string
+  /** 鉴定人（归属） */
+  identifier: string
+  /** 版本号：保存时 +1 */
+  version: number
 }

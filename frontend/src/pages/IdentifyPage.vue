@@ -13,9 +13,14 @@ import {
   ID_CONFIDENCES,
   SPORE_COLORS
 } from '@/types'
+import type { FieldConflict } from '@/types/concurrency'
+import { ConflictError } from '@/types/concurrency'
+import ConflictDialog from '@/components/common/ConflictDialog.vue'
 import GillAttachmentTag from '@/components/common/GillAttachmentTag.vue'
 import SporePrintSwatch from '@/components/common/SporePrintSwatch.vue'
 import { useStore } from '@/hooks/usePersistentStore'
+import { useEditorLock } from '@/hooks/useEditorLock'
+import { useVersionedDraft } from '@/hooks/useVersionedDraft'
 import { EMPTY_CRITERIA, useCandidateMatch, type MatchCriteria } from '@/hooks/useCandidateMatch'
 import { recordStore } from '@/stores/recordStore'
 import { sporeStore } from '@/stores/sporeStore'
@@ -38,6 +43,25 @@ const { candidates, hasCondition } = useCandidateMatch(
 const activeRecordId = ref('')
 const active = computed(() => recordState.records.find((item) => item.id === activeRecordId.value) ?? null)
 
+/** 该条目的最新鉴定结论（鉴定人在其基础上编辑） */
+const latestLog = computed<IdentifyLog | null>(() => {
+  const list = identifyState.logs
+    .filter((item) => item.recordId === activeRecordId.value)
+    .sort((a, b) => (b.date + b.id).localeCompare(a.date + a.id))
+  return list[0] ?? null
+})
+
+// 编辑锁：鉴定人角色，同一条目同一时间只允许一个窗口写结论
+const { readOnly, lockHolder } = useEditorLock('record', computed(() => activeRecordId.value), 'identifier')
+
+// 版本化草稿
+const {
+  baseVersion: logBaseVersion,
+  baseSnapshot: logBaseSnapshot,
+  reset: resetLogVersion,
+  commit: commitLog
+} = useVersionedDraft(latestLog)
+
 const logForm = reactive({
   conclusion: '',
   basis: '形态特征' as IdentifyLog['basis'],
@@ -47,6 +71,40 @@ const logForm = reactive({
   needReview: true,
   reviewer: ''
 })
+
+// 冲突对话框
+const conflictVisible = ref(false)
+const conflictConflicts = ref<FieldConflict[]>([])
+const conflictBaseVersion = ref(1)
+const conflictCurrentVersion = ref(1)
+
+function showConflict(e: ConflictError): void {
+  conflictConflicts.value = e.conflicts
+  conflictBaseVersion.value = e.baseVersion
+  conflictCurrentVersion.value = e.currentVersion
+  conflictVisible.value = true
+}
+
+/** 把最新结论载入表单 */
+function loadLatestIntoForm(log: IdentifyLog | null): void {
+  if (log) {
+    logForm.conclusion = log.conclusion
+    logForm.basis = log.basis
+    logForm.referenceBook = log.referenceBook
+    logForm.referencePage = log.referencePage
+    logForm.confidence = log.confidence
+    logForm.needReview = log.needReview
+    logForm.reviewer = log.reviewer
+    resetLogVersion(log)
+  } else {
+    logForm.conclusion = ''
+    logForm.referenceBook = ''
+    logForm.referencePage = ''
+    logForm.reviewer = ''
+  }
+}
+
+watch(latestLog, (log) => loadLatestIntoForm(log), { immediate: true })
 
 watch(
   () => [recordState.records.length, activeRecordId.value] as const,
@@ -77,6 +135,12 @@ function draftConclusion(tempName: string): string {
   return tempName.replace(/[（(].*?[)）]/g, '').trim()
 }
 
+async function handleRetry(): Promise<void> {
+  await identifyStore.getState().hydrate()
+  loadLatestIntoForm(latestLog.value)
+  ElMessage.info('已载入最新结论，请重新编辑后保存')
+}
+
 async function saveLog(): Promise<void> {
   if (!active.value) {
     ElMessage.warning('请先在候选名录中选择要落结论的条目')
@@ -87,7 +151,7 @@ async function saveLog(): Promise<void> {
     return
   }
   const log: IdentifyLog = {
-    id: uid('idf'),
+    id: latestLog.value?.id ?? uid('idf'),
     recordId: active.value.id,
     conclusion: logForm.conclusion.trim(),
     basis: logForm.basis,
@@ -96,11 +160,23 @@ async function saveLog(): Promise<void> {
     confidence: logForm.confidence,
     needReview: logForm.needReview,
     reviewer: logForm.reviewer.trim(),
-    date: new Date().toISOString().slice(0, 10)
+    date: latestLog.value?.date ?? new Date().toISOString().slice(0, 10),
+    identifier: latestLog.value?.identifier || logForm.reviewer.trim() || '',
+    version: latestLog.value?.version ?? 1
   }
-  await identifyStore.getState().save(log)
-  ElMessage.success(`${active.value.code} 已记录结论：${log.conclusion}（${log.confidence}）`)
-  logForm.conclusion = ''
+  try {
+    const result = await identifyStore
+      .getState()
+      .save(log, logBaseVersion.value, logBaseSnapshot.value ?? log)
+    commitLog(result.saved)
+    ElMessage.success(`${active.value.code} 已记录结论：${log.conclusion}（${log.confidence}）`)
+  } catch (e) {
+    if (e instanceof ConflictError) {
+      showConflict(e)
+    } else {
+      throw e
+    }
+  }
 }
 
 const latestOf = (recordId: string): IdentifyLog | undefined =>
@@ -118,6 +194,14 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
       </div>
       <el-tag type="info" effect="plain">{{ hasCondition ? '已设条件，按匹配度排序' : '未设条件，按编号排序' }}</el-tag>
     </div>
+
+    <el-alert
+      v-if="readOnly"
+      class="lock-banner"
+      type="warning"
+      show-icon
+      :title="`该条目的结论正被其他窗口编辑（会话 ${lockHolder ?? '未知'}），当前为只读模式。对方关闭窗口或超时后将自动释放。`"
+    />
 
     <div class="layout">
       <el-card shadow="never" class="criteria-card">
@@ -204,6 +288,7 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
                   size="small"
                   type="primary"
                   plain
+                  :disabled="readOnly"
                   @click.stop="pickCandidate(item.record.id, draftConclusion(item.record.tempName))"
                 >
                   以该条为结论草稿
@@ -220,22 +305,23 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
           <template #header>
             记录鉴定结论
             <span v-if="active" class="muted"> · 目标条目 {{ active.code }}（{{ pointName(active.pointId) }}）</span>
+            <el-tag v-if="latestLog" size="small" effect="plain" round class="ver-tag">鉴定稿 v{{ latestLog.version }}</el-tag>
           </template>
           <el-form label-width="92px">
             <el-form-item label="结论学名" required>
-              <el-input v-model="logForm.conclusion" placeholder="如 Lepista sordida" />
+              <el-input v-model="logForm.conclusion" placeholder="如 Lepista sordida" :disabled="readOnly" />
             </el-form-item>
             <el-row :gutter="12">
               <el-col :span="12">
                 <el-form-item label="依据">
-                  <el-select v-model="logForm.basis" style="width: 100%">
+                  <el-select v-model="logForm.basis" style="width: 100%" :disabled="readOnly">
                     <el-option v-for="item in ID_BASES" :key="item" :label="item" :value="item" />
                   </el-select>
                 </el-form-item>
               </el-col>
               <el-col :span="12">
                 <el-form-item label="置信度">
-                  <el-select v-model="logForm.confidence" style="width: 100%">
+                  <el-select v-model="logForm.confidence" style="width: 100%" :disabled="readOnly">
                     <el-option v-for="item in ID_CONFIDENCES" :key="item" :label="item" :value="item" />
                   </el-select>
                 </el-form-item>
@@ -244,34 +330,42 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
             <el-row :gutter="12">
               <el-col :span="14">
                 <el-form-item label="参考图鉴">
-                  <el-input v-model="logForm.referenceBook" placeholder="如 《菌物图鉴》" />
+                  <el-input v-model="logForm.referenceBook" placeholder="如 《菌物图鉴》" :disabled="readOnly" />
                 </el-form-item>
               </el-col>
               <el-col :span="10">
                 <el-form-item label="页码">
-                  <el-input v-model="logForm.referencePage" placeholder="如 P.145" />
+                  <el-input v-model="logForm.referencePage" placeholder="如 P.145" :disabled="readOnly" />
                 </el-form-item>
               </el-col>
             </el-row>
             <el-row :gutter="12">
               <el-col :span="12">
                 <el-form-item label="复核人">
-                  <el-input v-model="logForm.reviewer" placeholder="如 祁野" />
+                  <el-input v-model="logForm.reviewer" placeholder="如 祁野" :disabled="readOnly" />
                 </el-form-item>
               </el-col>
               <el-col :span="12">
                 <el-form-item label="待复核">
-                  <el-switch v-model="logForm.needReview" />
+                  <el-switch v-model="logForm.needReview" :disabled="readOnly" />
                 </el-form-item>
               </el-col>
             </el-row>
             <div class="form-actions">
-              <el-button type="primary" @click="saveLog">保存鉴定结论</el-button>
+              <el-button type="primary" :disabled="readOnly" @click="saveLog">保存鉴定结论</el-button>
             </div>
           </el-form>
         </el-card>
       </div>
     </div>
+
+    <ConflictDialog
+      v-model:visible="conflictVisible"
+      :conflicts="conflictConflicts"
+      :base-version="conflictBaseVersion"
+      :current-version="conflictCurrentVersion"
+      @retry="handleRetry"
+    />
   </div>
 </template>
 
@@ -281,6 +375,14 @@ const latestOf = (recordId: string): IdentifyLog | undefined =>
   flex-wrap: wrap;
   gap: 16px;
   align-items: flex-start;
+}
+.lock-banner {
+  margin-bottom: 12px;
+  border-radius: 8px;
+}
+.ver-tag {
+  margin-left: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .criteria-card {
   width: 300px;

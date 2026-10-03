@@ -175,9 +175,12 @@ async function submit(): Promise<void> {
     hostTree: form.hostTree.trim(),
     collectDate: form.collectDate,
     collector: form.collector.trim(),
-    note: form.note.trim()
+    note: form.note.trim(),
+    recorder: form.collector.trim(),
+    identifier: '',
+    version: 1
   }
-  await recordStore.getState().save(record)
+  await recordStore.getState().save(record, record.version, record)
   dialogVisible.value = false
   ElMessage.success(`条目 ${record.code} 已建立`)
 }

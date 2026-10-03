@@ -19,4 +19,8 @@ export interface CollectPoint {
   companionTrees: string
   collectDate: string
   collector: string
+  /** 记录员（归属） */
+  recorder: string
+  /** 版本号：保存时 +1 */
+  version: number
 }
